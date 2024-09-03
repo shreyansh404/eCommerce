@@ -9,7 +9,7 @@ import json
 from bson import json_util
 
 # Created a Mongo instance to work with database
-mongo = MongoClient("mongodb://127.0.0.1:27017/cc-ecommerce-db")['cc-ecommerce-db']
+mongo = MongoClient("mongodb://127.0.0.1:27017/ecommerce-db")['ecommerce']
 
 # Create an instance of FastAPI
 app = FastAPI()
@@ -38,31 +38,44 @@ class CreateOrder(BaseModel):
     total_amount: float
     user_address: UserAddress
 
-# GET products API as per query params passed
 @app.get("/products")
-def get_products(offset: int, limit: int, min_price: Optional[int] = None, max_price: Optional[int] = None):
+def get_products(
+    offset: int,
+    limit: int,
+    min_price: Optional[int] = None,
+    max_price: Optional[int] = None
+):
+    """
+    Retrieve a paginated list of products with optional price filtering.
+
+    Args:
+        offset (int): The number of documents to skip (for pagination).
+        limit (int): The maximum number of documents to return (for pagination).
+        min_price (Optional[int]): Minimum price filter for products (inclusive).
+        max_price (Optional[int]): Maximum price filter for products (inclusive).
+
+    Returns:
+        dict: A dictionary containing:
+            - "data": A list of product documents matching the criteria.
+            - "page": Pagination information including:
+                - "total": Total count of documents matching the filter.
+                - "limit": Number of documents returned per page.
+                - "nextOffset": The offset for the next page of results, or None if no more pages.
+                - "prevOffset": The offset for the previous page of results, or None if on the first page.
+    """
     agg_pipeline = []
 
-    # Applying filters on the provided min and max price in the query param
-    if min_price and max_price:
-        agg_pipeline.append({
-            "$match": {
-                "$and": [
-                    {"price": {"$gte": min_price}},
-                    {"price": {"$lte": max_price}}
-                ]
-            }
-        })
-    elif min_price:
-        agg_pipeline.append({
-            "$match": {"price": {"$gte": min_price}}
-        })
-    elif  max_price:
-        agg_pipeline.append({
-            "$match": {"price": {"$lte": max_price}}
-        })
+    # Apply filters
+    match_stage = {}
+    if min_price is not None:
+        match_stage["price"] = {"$gte": min_price}
+    if max_price is not None:
+        match_stage.setdefault("price", {})["$lte"] = max_price
 
-    # BONUS: PAGINATION LOGIC APPLIED USING $FACET
+    if match_stage:
+        agg_pipeline.append({"$match": match_stage})
+
+    # Pagination and counting
     agg_pipeline.append({
         "$facet": {
             "data": [
@@ -79,55 +92,50 @@ def get_products(offset: int, limit: int, min_price: Optional[int] = None, max_p
                 }
             ],
             "page": [
-                {"$skip": offset},
-                {"$limit": limit},
-                {
-                    "$count": "count"
-                },
-                {
-                    "$project": {
-                        "total": "$count",
-                        "nextOffset": {
-                            "$cond": [
-                                {"$lt": ["$count", limit]},
-                                None,
-                                {"$add": [offset, limit]}
-                            ]
-                        },
-                        "prevOffset": {
-                            "$cond": [
-                                {"$lte": [offset, 0]},
-                                None,
-                                {"$subtract": [offset, limit]}
-                            ]
-                        }
-                    }
-                }
+                {"$count": "total_count"}
             ]
         }
     })
 
     result = list(mongo['products'].aggregate(agg_pipeline))
 
-    result[0]['page'][0]['limit'] = limit
+    # Extract pagination info
+    data = result[0]['data']
+    total_count = result[0]['page'][0]['total_count'] if result[0]['page'] else 0
+    next_offset = offset + limit if offset + limit < total_count else None
+    prev_offset = offset - limit if offset > 0 else None
 
-    return json.loads(json_util.dumps(result))
+    return {
+        "data": data,
+        "page": {
+            "total": total_count,
+            "limit": limit,
+            "nextOffset": next_offset,
+            "prevOffset": prev_offset
+        }
+    }
 
-# API to create an order
 @app.post("/orders", response_model=Order)
 def create_order(order_data: CreateOrder):
+    """
+    Create a new order and insert it into the orders collection.
+
+    Args:
+        order_data (CreateOrder): The order data including items, total amount, and user address.
+
+    Returns:
+        Order: The created order object including the generated order ID.
+    """
     # Convert ObjectId to str (because of pydantic version compatibility)
     for item in order_data.items:
         item.productId = str(item.productId)
 
     # Create the order object
     order_obj = Order(
+        id=str(mongo['orders'].insert_one(order_data.dict()).inserted_id),
         items=order_data.items,
         total_amount=order_data.total_amount,
         user_address=order_data.user_address
     )
-
-    # Inserting the order in the orders collection
-    mongo['orders'].insert_one(order_obj.dict())
 
     return order_obj
